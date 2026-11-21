@@ -48,9 +48,16 @@ def run_helper(args: list[str], timeout: int = 300) -> dict:
     return doc["data"]
 
 
-def account_args(email: str | None, anisette: str) -> list[str]:
+def account_args(email: str | None, anisette: str, saved_login: bool = False) -> list[str]:
+    """Build helper account arguments.
+
+    With ``saved_login`` the helper reads the password from the OS keyring entry
+    written by the iloader GUI, so ``ILOADER_PASSWORD`` is not required.
+    """
     if not email:
         raise BackendError("No Apple ID set. Run: session set-account <email>")
+    if saved_login:
+        return ["--email", email, "--anisette", anisette, "--use-saved-login"]
     if not os.environ.get("ILOADER_PASSWORD"):
         raise BackendError("ILOADER_PASSWORD environment variable is not set")
     return ["--email", email, "--anisette", anisette]

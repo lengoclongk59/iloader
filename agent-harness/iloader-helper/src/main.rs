@@ -7,8 +7,15 @@
 //! Secrets are never accepted on argv: the Apple ID password is read from the
 //! `ILOADER_PASSWORD` environment variable, and the 2FA code from
 //! `ILOADER_2FA_CODE` (or stdin when unset).
+//!
+//! With `--use-saved-login` the password is instead read from the OS keyring
+//! entry the iloader GUI writes (service `iloader`, user = email), and the
+//! anisette state and signing certificate are shared with the GUI through the
+//! same keyring storage. Keep the GUI idle while the helper runs.
 
 use std::{path::PathBuf, process::ExitCode};
+
+use keyring::Entry;
 
 use idevice::{
     IdeviceService,
@@ -16,7 +23,7 @@ use idevice::{
     usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection},
 };
 use isideload::{
-    anisette::remote_v3::RemoteV3AnisetteProvider,
+    anisette::{AnisetteClientInfo, remote_v3::RemoteV3AnisetteProvider},
     auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
     dev::{
         app_ids::AppIdsApi, certificates::CertificatesApi, developer_session::DeveloperSession,
@@ -29,6 +36,8 @@ use isideload::{
     util::{
         callbacks::{ExtensionsBehaviorCallbackBox, MaxCertsCallbackBox},
         fs_storage::FsStorage,
+        keyring_storage::KeyringStorage,
+        storage::SideloadingStorage,
     },
 };
 use rootcause::prelude::*;
@@ -45,6 +54,7 @@ struct Args {
     anisette: String,
     data_dir: PathBuf,
     udid: Option<String>,
+    use_saved_login: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("iloader-cli")),
         udid: None,
+        use_saved_login: false,
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -66,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
             "--anisette" => a.anisette = it.next().ok_or("--anisette needs a value")?,
             "--data-dir" => a.data_dir = it.next().ok_or("--data-dir needs a value")?.into(),
             "--udid" => a.udid = it.next(),
+            "--use-saved-login" => a.use_saved_login = true,
             _ => a.positional.push(arg),
         }
     }
@@ -77,8 +89,14 @@ async fn login(a: &Args) -> Result<Sl, String> {
         .email
         .clone()
         .ok_or("--email is required for this command")?;
-    let password =
-        std::env::var("ILOADER_PASSWORD").map_err(|_| "ILOADER_PASSWORD is not set".to_string())?;
+    let password: String = if a.use_saved_login {
+        // Same entry the GUI's `login_stored` command reads; never printed or logged.
+        Entry::new("iloader", &email)
+            .and_then(|entry| entry.get_password())
+            .map_err(|e| format!("no saved iloader login for {email} in the keyring: {e}"))?
+    } else {
+        std::env::var("ILOADER_PASSWORD").map_err(|_| "ILOADER_PASSWORD is not set".to_string())?
+    };
     std::fs::create_dir_all(&a.data_dir).map_err(|e| e.to_string())?;
 
     let tfa = |_params: TwoFactorCallbackParams| {
@@ -102,15 +120,29 @@ async fn login(a: &Args) -> Result<Sl, String> {
     } else {
         format!("https://{}", a.anisette)
     };
-    let storage = || Box::new(FsStorage::new(a.data_dir.clone()));
+    let storage = || -> Box<dyn SideloadingStorage> {
+        if a.use_saved_login {
+            Box::new(KeyringStorage::new("iloader".to_string()))
+        } else {
+            Box::new(FsStorage::new(a.data_dir.clone()))
+        }
+    };
+    let mut provider: RemoteV3AnisetteProvider = RemoteV3AnisetteProvider::default()
+        .map_err(|e| format!("{e:?}"))?
+        .set_serial_number("0".to_string())
+        .set_storage(storage())
+        .set_url(&url);
+    if a.use_saved_login {
+        // Mirror the GUI's client info so the shared anisette state stays valid.
+        provider = provider.set_client_info_override(Some(AnisetteClientInfo {
+            client_info: "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> \
+                          <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                .to_string(),
+            user_agent: "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0".to_string(),
+        }));
+    }
     let mut account = AppleAccount::builder(&email.to_lowercase())
-        .anisette_provider(
-            RemoteV3AnisetteProvider::default()
-                .map_err(|e| format!("{e:?}"))?
-                .set_serial_number("0".to_string())
-                .set_storage(storage())
-                .set_url(&url),
-        )
+        .anisette_provider(provider)
         .login(&password, Box::new(tfa))
         .await
         .map_err(|e| format!("login failed: {e:?}"))?;
@@ -120,8 +152,14 @@ async fn login(a: &Args) -> Result<Sl, String> {
 
     // Headless: never revoke certificates silently; abort instead.
     let max_certs: MaxCertsCallbackBox = Box::new(|_certs| Box::pin(async { Ok(None) }));
+    // The GUI names its certificates "iloader"; match it so saved-login runs reuse them.
+    let machine_name: &str = if a.use_saved_login {
+        "iloader"
+    } else {
+        "iloader-cli"
+    };
     Ok(SideloaderBuilder::new(dev, email.to_lowercase())
-        .machine_name("iloader-cli".into())
+        .machine_name(machine_name.into())
         .storage(storage())
         .extensions_behavior(ExtensionsBehaviorSelection::Fixed(
             ExtensionsBehavior::ReuseMain,
@@ -276,6 +314,13 @@ async fn run(a: &Args) -> Result<Value, String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Opt-in diagnostics: `RUST_LOG=isideload=debug` logs to stderr, never stdout.
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let res = match parse_args() {
         Ok(a) => run(&a).await,
         Err(e) => Err(e),

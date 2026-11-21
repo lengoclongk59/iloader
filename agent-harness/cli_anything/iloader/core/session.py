@@ -55,7 +55,13 @@ class Session:
 
     def __init__(self, path: str | None = None):
         self.path = path or default_session_path()
-        self.state = {"email": None, "anisette": DEFAULT_ANISETTE, "device": None, "history": []}
+        self.state = {
+            "email": None,
+            "anisette": DEFAULT_ANISETTE,
+            "device": None,
+            "saved_login": False,
+            "history": [],
+        }
         self._undo: list[dict] = []
         self._redo: list[dict] = []
         self.modified = False
@@ -103,6 +109,7 @@ class Session:
             "email": self.state["email"],
             "anisette": self.state["anisette"],
             "device": self.state["device"],
+            "saved_login": self.state["saved_login"],
             "history_len": len(self.state["history"]),
             "modified": self.modified,
             "password_env_set": bool(os.environ.get("ILOADER_PASSWORD")),

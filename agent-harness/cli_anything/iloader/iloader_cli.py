@@ -103,12 +103,18 @@ def session_status(ctx):
 @session.command("set-account")
 @click.argument("email")
 @click.option("--anisette", default=None, help=f"Anisette server (known: {', '.join(ANISETTE_SERVERS)})")
+@click.option(
+    "--use-saved-login",
+    "saved_login",
+    is_flag=True,
+    help="Read the password from the iloader GUI's keyring entry instead of ILOADER_PASSWORD",
+)
 @guarded
 @click.pass_context
-def set_account(ctx, email, anisette):
-    """Set the Apple ID (password comes from ILOADER_PASSWORD, never stored)."""
+def set_account(ctx, email, anisette, saved_login):
+    """Set the Apple ID (password from ILOADER_PASSWORD or the GUI keyring; never stored)."""
     sess = get_session()
-    changes = {"email": email.lower()}
+    changes = {"email": email.lower(), "saved_login": saved_login}
     if anisette:
         changes["anisette"] = anisette
     sess.mutate(**changes)
@@ -199,7 +205,7 @@ def account():
 
 def _acct_args():
     st = get_session().state
-    return backend.account_args(st["email"], st["anisette"])
+    return backend.account_args(st["email"], st["anisette"], st.get("saved_login", False))
 
 
 @account.command("certs")

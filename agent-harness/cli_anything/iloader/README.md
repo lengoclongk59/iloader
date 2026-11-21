@@ -25,6 +25,15 @@ cli-anything-iloader --help
 The Apple ID password is **never** a CLI argument or stored in the session. Export
 `ILOADER_PASSWORD` for the command; 2FA codes come from `ILOADER_2FA_CODE` (or stdin).
 
+### Reusing the GUI login (experimental)
+
+`session set-account <email> --anisette <server> --use-saved-login` makes the helper read the
+password from the OS keyring entry the iloader GUI saves (service `iloader`, user = email) and share
+the GUI's anisette state and certificate storage. Keep the GUI idle while the CLI runs. Status:
+the keyring read works, but against a real Apple ID the initial GrandSlam login request was
+rejected with `-22410` while the GUI's own login succeeded, so this path is not yet verified.
+Set `RUST_LOG=isideload=debug` when running the helper directly to see its progress on stderr.
+
 ## Usage
 
 ```bash
