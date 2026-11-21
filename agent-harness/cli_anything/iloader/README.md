@@ -25,13 +25,22 @@ cli-anything-iloader --help
 The Apple ID password is **never** a CLI argument or stored in the session. Export
 `ILOADER_PASSWORD` for the command; 2FA codes come from `ILOADER_2FA_CODE` (or stdin).
 
-### Reusing the GUI login (experimental)
+### Reusing the GUI's saved password (experimental)
 
 `session set-account <email> --anisette <server> --use-saved-login` makes the helper read the
-password from the OS keyring entry the iloader GUI saves (service `iloader`, user = email) and share
-the GUI's anisette state and certificate storage. Keep the GUI idle while the CLI runs. Status:
-the keyring read works, but against a real Apple ID the initial GrandSlam login request was
-rejected with `-22410` while the GUI's own login succeeded, so this path is not yet verified.
+password from the OS keyring entry the iloader GUI saves (service `iloader`, user = email). The
+CLI keeps its **own** anisette identity under `~/.cli-anything-iloader/helper` (or
+`$ILOADER_CLI_HOME/helper`). It reuses the GUI's development certificate (machine name `iloader`)
+through a **read-only** view of the GUI's keyring storage, so it never creates or revokes a
+certificate and can never overwrite the GUI's certificate key. Free Apple IDs allow only one
+development certificate, which is why the certificate is shared instead of creating a second one.
+
+Sharing the GUI's anisette state was tried first and Apple rejected the login with GrandSlam
+`-22410`, so only the certificate is shared. A new anisette identity may ask for a 2FA code on its
+first login (it did not in the verified run); later runs reuse it.
+
+For callers without an interactive stdin, set `ILOADER_2FA_FILE=<path>`: the helper then waits up to
+3 minutes for that file to appear, reads the code from it and deletes it.
 Set `RUST_LOG=isideload=debug` when running the helper directly to see its progress on stderr.
 
 ## Usage

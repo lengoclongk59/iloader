@@ -1528,6 +1528,7 @@ dependencies = [
  "isideload",
  "keyring",
  "rootcause",
+ "rustls",
  "serde_json",
  "tokio",
  "tracing-subscriber",

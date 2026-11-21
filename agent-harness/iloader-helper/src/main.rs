@@ -9,11 +9,20 @@
 //! `ILOADER_2FA_CODE` (or stdin when unset).
 //!
 //! With `--use-saved-login` the password is instead read from the OS keyring
-//! entry the iloader GUI writes (service `iloader`, user = email), and the
-//! anisette state and signing certificate are shared with the GUI through the
-//! same keyring storage. Keep the GUI idle while the helper runs.
+//! entry the iloader GUI writes (service `iloader`, user = email). The helper
+//! keeps its own anisette identity under `--data-dir` (sharing the GUI's made Apple reject
+//! the login with -22410) and reuses the GUI's signing certificate through a read-only view
+//! of its keyring storage, so it can never overwrite the GUI's certificate key.
+//!
+//! `--2fa-file <path>` (or `ILOADER_2FA_FILE`) makes the helper wait (up to 3 minutes) for a file to
+//! appear holding the 2FA code, which is deleted after reading. This lets a
+//! caller without an interactive stdin supply the code once Apple sends it.
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::{Duration, Instant},
+};
 
 use keyring::Entry;
 
@@ -55,6 +64,7 @@ struct Args {
     data_dir: PathBuf,
     udid: Option<String>,
     use_saved_login: bool,
+    tfa_file: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -65,11 +75,22 @@ fn parse_args() -> Result<Args, String> {
         positional: vec![],
         email: None,
         anisette: DEFAULT_ANISETTE.into(),
+        // Anisette identity and certificate must outlive temp cleanups.
         data_dir: std::env::var_os("ILOADER_CLI_HOME")
-            .map(PathBuf::from)
+            .map(|home| PathBuf::from(home).join("helper"))
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .or_else(|| std::env::var_os("HOME"))
+                    .map(|home| {
+                        PathBuf::from(home)
+                            .join(".cli-anything-iloader")
+                            .join("helper")
+                    })
+            })
             .unwrap_or_else(|| std::env::temp_dir().join("iloader-cli")),
         udid: None,
         use_saved_login: false,
+        tfa_file: std::env::var_os("ILOADER_2FA_FILE").map(PathBuf::from),
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -78,10 +99,63 @@ fn parse_args() -> Result<Args, String> {
             "--data-dir" => a.data_dir = it.next().ok_or("--data-dir needs a value")?.into(),
             "--udid" => a.udid = it.next(),
             "--use-saved-login" => a.use_saved_login = true,
+            "--2fa-file" => a.tfa_file = it.next().map(PathBuf::from),
             _ => a.positional.push(arg),
         }
     }
     Ok(a)
+}
+
+/// Read-only view of the GUI's keyring storage (service `iloader`).
+///
+/// The sideloader only ever writes one thing here, the certificate private key, and it does so
+/// when it cannot find one. Refusing every write guarantees the helper can never replace the
+/// key the GUI's certificate depends on.
+struct ReadOnlyKeyringStorage {
+    inner: KeyringStorage,
+}
+
+impl SideloadingStorage for ReadOnlyKeyringStorage {
+    fn store(&self, key: &str, _value: &str) -> Result<(), Report> {
+        Err(report!(
+            "refusing to write {key} to the GUI keyring storage"
+        ))
+    }
+
+    fn retrieve(&self, key: &str) -> Result<Option<String>, Report> {
+        self.inner.retrieve(key)
+    }
+
+    fn store_data(&self, key: &str, _value: &[u8]) -> Result<(), Report> {
+        Err(report!(
+            "refusing to write {key} to the GUI keyring storage"
+        ))
+    }
+
+    fn retrieve_data(&self, key: &str) -> Result<Option<Vec<u8>>, Report> {
+        self.inner.retrieve_data(key)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), Report> {
+        Err(report!(
+            "refusing to delete {key} from the GUI keyring storage"
+        ))
+    }
+}
+
+/// Waits up to three minutes for `path` to appear, then returns its contents and deletes it.
+async fn wait_for_code_file(path: &Path) -> Result<String, Report> {
+    let deadline: Instant = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < deadline {
+        if let Ok(code) = std::fs::read_to_string(path) {
+            if !code.trim().is_empty() {
+                std::fs::remove_file(path)?;
+                return Ok(code);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(report!("timed out waiting for the 2FA code file"))
 }
 
 async fn login(a: &Args) -> Result<Sl, String> {
@@ -99,11 +173,14 @@ async fn login(a: &Args) -> Result<Sl, String> {
     };
     std::fs::create_dir_all(&a.data_dir).map_err(|e| e.to_string())?;
 
-    let tfa = |_params: TwoFactorCallbackParams| {
+    let tfa_file: Option<PathBuf> = a.tfa_file.clone();
+    let tfa = move |_params: TwoFactorCallbackParams| {
+        let tfa_file = tfa_file.clone();
         Box::pin(async move {
-            let code = match std::env::var("ILOADER_2FA_CODE") {
-                Ok(c) => c,
-                Err(_) => {
+            let code = match (std::env::var("ILOADER_2FA_CODE"), tfa_file) {
+                (Ok(c), _) => c,
+                (Err(_), Some(path)) => wait_for_code_file(&path).await?,
+                (Err(_), None) => {
                     let mut line = String::new();
                     std::io::stdin().read_line(&mut line)?;
                     line
@@ -120,29 +197,23 @@ async fn login(a: &Args) -> Result<Sl, String> {
     } else {
         format!("https://{}", a.anisette)
     };
-    let storage = || -> Box<dyn SideloadingStorage> {
-        if a.use_saved_login {
-            Box::new(KeyringStorage::new("iloader".to_string()))
-        } else {
-            Box::new(FsStorage::new(a.data_dir.clone()))
-        }
+    let storage = || Box::new(FsStorage::new(a.data_dir.clone()));
+    // Mirror the GUI's client info override (see `account.rs` in src-tauri).
+    let client_info = AnisetteClientInfo {
+        client_info: "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> \
+                      <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+            .to_string(),
+        user_agent: "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0".to_string(),
     };
-    let mut provider: RemoteV3AnisetteProvider = RemoteV3AnisetteProvider::default()
-        .map_err(|e| format!("{e:?}"))?
-        .set_serial_number("0".to_string())
-        .set_storage(storage())
-        .set_url(&url);
-    if a.use_saved_login {
-        // Mirror the GUI's client info so the shared anisette state stays valid.
-        provider = provider.set_client_info_override(Some(AnisetteClientInfo {
-            client_info: "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> \
-                          <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-                .to_string(),
-            user_agent: "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0".to_string(),
-        }));
-    }
     let mut account = AppleAccount::builder(&email.to_lowercase())
-        .anisette_provider(provider)
+        .anisette_provider(
+            RemoteV3AnisetteProvider::default()
+                .map_err(|e| format!("{e:?}"))?
+                .set_serial_number("0".to_string())
+                .set_storage(storage())
+                .set_client_info_override(Some(client_info))
+                .set_url(&url),
+        )
         .login(&password, Box::new(tfa))
         .await
         .map_err(|e| format!("login failed: {e:?}"))?;
@@ -152,15 +223,21 @@ async fn login(a: &Args) -> Result<Sl, String> {
 
     // Headless: never revoke certificates silently; abort instead.
     let max_certs: MaxCertsCallbackBox = Box::new(|_certs| Box::pin(async { Ok(None) }));
-    // The GUI names its certificates "iloader"; match it so saved-login runs reuse them.
-    let machine_name: &str = if a.use_saved_login {
-        "iloader"
+    // With the saved login, reuse the GUI's certificate (machine name "iloader", key in its
+    // keyring) read-only instead of creating a second one, which free accounts cannot afford.
+    let (machine_name, cert_storage): (&str, Box<dyn SideloadingStorage>) = if a.use_saved_login {
+        (
+            "iloader",
+            Box::new(ReadOnlyKeyringStorage {
+                inner: KeyringStorage::new("iloader".to_string()),
+            }),
+        )
     } else {
-        "iloader-cli"
+        ("iloader-cli", Box::new(FsStorage::new(a.data_dir.clone())))
     };
     Ok(SideloaderBuilder::new(dev, email.to_lowercase())
         .machine_name(machine_name.into())
-        .storage(storage())
+        .storage(cert_storage)
         .extensions_behavior(ExtensionsBehaviorSelection::Fixed(
             ExtensionsBehavior::ReuseMain,
         ))
@@ -314,6 +391,11 @@ async fn run(a: &Args) -> Result<Value, String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Both `ring` and `aws-lc-rs` are in the dependency tree, so rustls cannot pick a default
+    // provider itself and would panic when provisioning anisette over a websocket.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("no other rustls CryptoProvider is installed this early in main");
     // Opt-in diagnostics: `RUST_LOG=isideload=debug` logs to stderr, never stdout.
     if std::env::var_os("RUST_LOG").is_some() {
         tracing_subscriber::fmt()
